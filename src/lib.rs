@@ -696,8 +696,8 @@ pub enum AlphaMode {
     ///
     /// ## Platform Dependent Behavior
     ///
-    /// - Android, macOS/iOS, DRM/KMS, Orbital, Wayland, Windows, X11: Supported.
-    /// - Web: Cannot be supported in a zero-copy manner.
+    /// - Android, DRM/KMS, Orbital, Wayland, Windows, X11: Supported.
+    /// - macOS/iOS and Web: Cannot be supported in a zero-copy manner.
     ///
     /// # Example
     ///
@@ -747,11 +747,10 @@ pub enum AlphaMode {
     ///
     /// ## Platform Dependent Behavior
     ///
-    /// - Wayland and DRM/KMS: Supported.
+    /// - Wayland, macOS/iOS and DRM/KMS: Supported.
     /// - Web: Not yet supported (TODO `ImageBitmap`).
     /// - Android, Orbital, Windows and X11: Not supported (yet unknown if they can be, feel
     ///   free to open an issue about it).
-    /// - macOS/iOS: Not supported (doesn't seem to work with additive values).
     #[doc(alias = "Associated")]
     Premultiplied,
     /// The non-alpha channels are not expected to already be multiplied by the alpha channel;
@@ -762,9 +761,10 @@ pub enum AlphaMode {
     ///
     /// ## Platform Dependent Behavior
     ///
-    /// - Web and macOS/iOS: Supported.
+    /// - Web: Supported.
     /// - Android, DRM/KMS, Orbital, Wayland, Windows, X11: Not supported (yet unknown if they can
     ///   be, feel free to open an issue about it).
+    /// - macOS/iOS: Cannot be supported in a zero-copy manner.
     #[doc(alias = "Straight")]
     #[doc(alias = "Unassociated")]
     #[doc(alias = "Unpremultiplied")]
