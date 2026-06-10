@@ -1,25 +1,30 @@
 //! Softbuffer implementation using CoreGraphics.
 use crate::error::InitError;
-use crate::{backend_interface::*, AlphaMode};
+use crate::{backend_interface::*, AlphaMode, PresentMode};
 use crate::{Pixel, Rect, SoftBufferError};
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, Bool};
-use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass, MainThreadMarker, Message};
-use objc2_core_foundation::{CFMutableDictionary, CFNumber, CFRetained, CFString, CFType, CGPoint};
+use objc2::runtime::{AnyObject, Bool, NSObjectProtocol};
+use objc2::{define_class, msg_send, sel, AllocAnyThread, DefinedClass, MainThreadMarker, Message};
+use objc2_core_foundation::{
+    kCFRunLoopDefaultMode, CFMutableDictionary, CFNumber, CFRetained, CFRunLoop, CFString, CFType,
+    CGPoint,
+};
 use objc2_core_graphics::CGColorSpace;
 use objc2_foundation::{
-    ns_string, NSDictionary, NSKeyValueChangeKey, NSKeyValueChangeNewKey,
+    ns_string, NSDefaultRunLoopMode, NSDictionary, NSKeyValueChangeKey, NSKeyValueChangeNewKey,
     NSKeyValueObservingOptions, NSNumber, NSObject, NSObjectNSKeyValueObserverRegistration,
-    NSString, NSValue,
+    NSRunLoop, NSString, NSValue,
 };
 use objc2_io_surface::{
     kIOSurfaceBytesPerElement, kIOSurfaceCacheMode, kIOSurfaceColorSpace, kIOSurfaceHeight,
     kIOSurfaceMapWriteCombineCache, kIOSurfacePixelFormat, kIOSurfaceWidth, IOSurfaceLockOptions,
     IOSurfaceRef,
 };
-use objc2_quartz_core::{kCAFilterNearest, kCAGravityResize, CALayer, CATransaction};
+use objc2_quartz_core::{
+    kCAFilterNearest, kCAGravityResize, CADisplayLink, CALayer, CATransaction,
+};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawWindowHandle};
-use tracing::trace;
+use tracing::{trace, warn};
 
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -28,6 +33,9 @@ use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::ptr;
 use std::slice;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// Number of buffers we rotate through (triple-buffering).
@@ -45,6 +53,10 @@ const BUFFER_COUNT: usize = 3;
 /// almost always already free, so this wait rarely triggers, and proceeding after the timeout only
 /// risks tearing in the pathological case where the compositor holds all buffers.
 const BACK_BUFFER_WAIT_TIMEOUT: Duration = Duration::from_millis(10);
+
+/// Refresh period assumed for [`PresentMode::Fifo`] pacing until the display link reports the
+/// real one (60 Hz).
+const DEFAULT_REFRESH_PERIOD: Duration = Duration::from_nanos(16_666_667);
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -115,6 +127,215 @@ impl Observer {
     }
 }
 
+/// State shared between the vsync thread's display-link callback and `next_buffer`.
+#[derive(Debug)]
+struct VsyncState {
+    /// Number of display refreshes since the link started.
+    ticks: Mutex<u64>,
+    /// Notified on each tick.
+    cond: Condvar,
+    /// The display's refresh period in nanoseconds as reported by the link, or 0 if not yet known.
+    period_nanos: AtomicU64,
+}
+
+impl VsyncState {
+    fn new() -> Self {
+        Self {
+            ticks: Mutex::new(0),
+            cond: Condvar::new(),
+            period_nanos: AtomicU64::new(0),
+        }
+    }
+
+    /// Block until the tick counter advances past `last`, returning the new count.
+    ///
+    /// The wait is bounded to two refresh periods: the display link can stop ticking (display
+    /// asleep, system under load), and a present must never block indefinitely on it.
+    fn wait_past(&self, last: u64) -> u64 {
+        let period = match self.period_nanos.load(Ordering::Relaxed) {
+            0 => DEFAULT_REFRESH_PERIOD,
+            nanos => Duration::from_nanos(nanos),
+        };
+        let ticks = self.ticks.lock().expect("vsync state poisoned");
+        let (ticks, _) = self
+            .cond
+            .wait_timeout_while(ticks, 2 * period, |ticks| *ticks <= last)
+            .expect("vsync state poisoned");
+        *ticks
+    }
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[name = "SoftbufferVsyncTarget"]
+    #[ivars = Arc<VsyncState>]
+    #[derive(Debug)]
+    struct VsyncTarget;
+
+    /// Target of the `CADisplayLink`; `tick:` is invoked on every display refresh.
+    impl VsyncTarget {
+        #[unsafe(method(tick:))]
+        fn tick(&self, link: &CADisplayLink) {
+            let state = self.ivars();
+
+            let period = link.duration();
+            if period > 0.0 {
+                let nanos = (period * 1_000_000_000.0) as u64;
+                state.period_nanos.store(nanos, Ordering::Relaxed);
+            }
+
+            *state.ticks.lock().expect("vsync state poisoned") += 1;
+            state.cond.notify_all();
+        }
+    }
+);
+
+impl VsyncTarget {
+    fn new(state: Arc<VsyncState>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(state);
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// A vsync tick source driven by a `CADisplayLink` on a dedicated thread.
+///
+/// The link needs a run loop to fire from, and the rendering thread's run loop can't be used:
+/// `next_buffer` blocks its calling thread while waiting for a tick, which on the main thread
+/// would stop the run loop from turning and deadlock. A dedicated thread makes ticks independent
+/// of what the rendering thread is doing.
+#[derive(Debug)]
+struct VsyncSource {
+    state: Arc<VsyncState>,
+    /// Tells the vsync thread to exit; checked between `run_in_mode` calls.
+    stop: Arc<AtomicBool>,
+    /// The vsync thread's run loop, used to interrupt it on `Drop`.
+    runloop: SendCFRunLoop,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl VsyncSource {
+    /// Create a vsync source for the window containing `view`.
+    ///
+    /// Returns `None` (no pacing) when a display link can't be created, e.g. on macOS < 14.
+    fn new(view: Option<&NSObject>) -> Option<Self> {
+        let state = Arc::new(VsyncState::new());
+        let target = VsyncTarget::new(Arc::clone(&state));
+        let link = Self::create_link(&target, view)?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+
+        let thread = thread::Builder::new()
+            .name("softbuffer-vsync".into())
+            .spawn({
+                let stop = Arc::clone(&stop);
+                move || Self::run(link, stop, tx)
+            });
+        let thread = match thread {
+            Ok(thread) => thread,
+            Err(err) => {
+                warn!("failed spawning vsync thread: {err}");
+                return None;
+            }
+        };
+
+        // The thread sends its run loop after registering the display link; an error means it
+        // died before getting that far.
+        let runloop = rx.recv().ok()?;
+
+        Some(Self {
+            state,
+            stop,
+            runloop,
+            thread: Some(thread),
+        })
+    }
+
+    /// Create a `CADisplayLink` whose `tick:` is sent to `target` on every display refresh.
+    ///
+    /// On macOS the link must be vended by the `NSView` (`-displayLinkWithTarget:selector:`,
+    /// macOS 14+); the standalone `+[CADisplayLink displayLinkWithTarget:selector:]` constructor
+    /// is `API_UNAVAILABLE(macos)` and produces a link that never fires there.
+    fn create_link(
+        target: &VsyncTarget,
+        view: Option<&NSObject>,
+    ) -> Option<SendCADisplayLink> {
+        #[cfg(target_os = "macos")]
+        {
+            let view = view?;
+            if !view.respondsToSelector(sel!(displayLinkWithTarget:selector:)) {
+                trace!("NSView displayLink unavailable (requires macOS 14), `PresentMode::Fifo` will not pace");
+                return None;
+            }
+            // SAFETY: The view responds to the selector (checked above, macOS 14+), `target` is
+            // retained by the link, and `VsyncTarget` implements `tick:` with the signature
+            // `CADisplayLink` invokes (one `CADisplayLink` argument).
+            let link: Retained<CADisplayLink> =
+                unsafe { msg_send![view, displayLinkWithTarget: target, selector: sel!(tick:)] };
+            Some(SendCADisplayLink(link))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = view;
+            // SAFETY: `target` is retained by the link, and `VsyncTarget` implements `tick:`
+            // with the signature `CADisplayLink` invokes.
+            let link =
+                unsafe { CADisplayLink::displayLinkWithTarget_selector(target, sel!(tick:)) };
+            Some(SendCADisplayLink(link))
+        }
+    }
+
+    fn run(link: SendCADisplayLink, stop: Arc<AtomicBool>, tx: mpsc::Sender<SendCFRunLoop>) {
+        let link = link.0;
+        // SAFETY: The run loop is the current thread's, and the mode is a valid static.
+        unsafe {
+            link.addToRunLoop_forMode(&NSRunLoop::currentRunLoop(), NSDefaultRunLoopMode);
+        }
+
+        let runloop = CFRunLoop::current().expect("thread must have a run loop");
+        if tx.send(SendCFRunLoop(runloop)).is_err() {
+            // `VsyncSource::new` bailed; clean up and exit.
+            link.invalidate();
+            return;
+        }
+
+        // Re-check `stop` at least once a second: `CFRunLoopStop` only interrupts a *running*
+        // loop, so a `Drop` racing our startup could otherwise be missed.
+        while !stop.load(Ordering::Relaxed) {
+            CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 1.0, false);
+        }
+
+        link.invalidate();
+    }
+}
+
+impl Drop for VsyncSource {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.runloop.0.stop();
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                warn!("vsync thread panicked");
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SendCFRunLoop(CFRetained<CFRunLoop>);
+
+// SAFETY: CFRunLoop is documented as thread-safe (unlike most of CoreFoundation):
+// https://developer.apple.com/documentation/corefoundation/cfrunloop
+unsafe impl Send for SendCFRunLoop {}
+
+#[derive(Debug)]
+struct SendCADisplayLink(Retained<CADisplayLink>);
+
+// SAFETY: The link is created on the main thread and moved to the vsync thread before being
+// used; only `invalidate` (documented thread-safe) and run-loop registration (called on the
+// run loop's own thread) are used after that.
+unsafe impl Send for SendCADisplayLink {}
+
 #[derive(Debug)]
 pub struct CGImpl<D, W> {
     /// Our layer.
@@ -145,6 +366,14 @@ pub struct CGImpl<D, W> {
     width: u32,
     /// The height of the buffers.
     height: u32,
+    /// Vsync tick source for [`PresentMode::Fifo`] pacing.
+    ///
+    /// `None` when `CADisplayLink` is unavailable (macOS < 14); `Fifo` then doesn't pace.
+    vsync: Option<VsyncSource>,
+    /// How `next_buffer` paces against the display, see [`PresentMode`].
+    present_mode: PresentMode,
+    /// The vsync tick count when `next_buffer` last handed out a buffer.
+    last_tick: u64,
     window_handle: W,
     _display: PhantomData<D>,
 }
@@ -178,7 +407,7 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for CGImpl<
             None,
         ))?;
 
-        let root_layer = match window_src.window_handle()?.as_raw() {
+        let (root_layer, ns_view) = match window_src.window_handle()?.as_raw() {
             RawWindowHandle::AppKit(handle) => {
                 // SAFETY: The pointer came from `WindowHandle`, which ensures that the
                 // `AppKitWindowHandle` contains a valid pointer to an `NSView`.
@@ -191,7 +420,10 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for CGImpl<
 
                 // SAFETY: `-[NSView layer]` returns an optional `CALayer`
                 let layer: Option<Retained<CALayer>> = unsafe { msg_send![view, layer] };
-                layer.expect("failed making the view layer-backed")
+                (
+                    layer.expect("failed making the view layer-backed"),
+                    Some(view.retain()),
+                )
             }
             RawWindowHandle::UiKit(handle) => {
                 // SAFETY: The pointer came from `WindowHandle`, which ensures that the
@@ -202,7 +434,7 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for CGImpl<
 
                 // SAFETY: `-[UIView layer]` returns `CALayer`
                 let layer: Retained<CALayer> = unsafe { msg_send![view, layer] };
-                layer
+                (layer, None)
             }
             _ => return Err(InitError::Unsupported(window_src)),
         };
@@ -292,6 +524,9 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for CGImpl<
             buffers,
             width,
             height,
+            vsync: VsyncSource::new(ns_view.as_deref()),
+            present_mode: PresentMode::default(),
+            last_tick: 0,
             _display: PhantomData,
             window_handle: window_src,
         })
@@ -344,7 +579,20 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for CGImpl<
         Ok(())
     }
 
+    fn set_present_mode(&mut self, present_mode: PresentMode) {
+        self.present_mode = present_mode;
+    }
+
     fn next_buffer(&mut self, _alpha_mode: AlphaMode) -> Result<BufferImpl<'_>, SoftBufferError> {
+        // Pace to the display refresh rate by waiting until the display link has ticked since the
+        // last acquire. The wait is time-bounded (see `VsyncState::wait_past`), so a stopped link
+        // degrades to a slower rate rather than blocking indefinitely.
+        if self.present_mode == PresentMode::Fifo {
+            if let Some(vsync) = &self.vsync {
+                self.last_tick = vsync.state.wait_past(self.last_tick);
+            }
+        }
+
         // We draw into the back buffer (`buffers.last()`) while the compositor reads the others.
         //
         // The back buffer was last presented two frames ago, so with triple-buffering the

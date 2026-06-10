@@ -124,6 +124,15 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> Surface<D, W> {
         self.alpha_mode
     }
 
+    /// Set how presenting the buffer is synchronized with the display.
+    ///
+    /// See [`PresentMode`] for the available modes and their platform support. The default is
+    /// [`PresentMode::Fifo`].
+    #[doc(alias = "vsync")]
+    pub fn set_present_mode(&mut self, present_mode: PresentMode) {
+        self.surface_impl.set_present_mode(present_mode);
+    }
+
     /// Set the size of the buffer.
     ///
     /// This is a convenience method for reconfiguring when only the size changes, it is equivalent
@@ -770,6 +779,41 @@ pub enum AlphaMode {
     #[doc(alias = "Unpremultiplied")]
     Postmultiplied,
     // Intentionally exhaustive, there are probably no other alpha modes that make sense.
+}
+
+/// Specifies how presenting the buffer is synchronized with the display.
+///
+/// The terminology follows [`wgpu::PresentMode`] (and Vulkan's `VkPresentModeKHR`).
+///
+/// [`wgpu::PresentMode`]: https://docs.rs/wgpu/latest/wgpu/enum.PresentMode.html
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+pub enum PresentMode {
+    /// Presentation is synchronized with the display refresh rate ("vsync on").
+    ///
+    /// [`Surface::next_buffer`] blocks until the display has had a chance to consume the
+    /// previously presented frame, so the application renders at most one frame per display
+    /// refresh.
+    ///
+    /// **This is the default.**
+    ///
+    /// ## Platform Dependent Behavior
+    ///
+    /// - macOS/iOS: Paced via `CADisplayLink` (macOS 14+). On older macOS versions no pacing
+    ///   occurs. The wait is time-bounded, so an occluded window degrades to a slower rate
+    ///   instead of blocking indefinitely.
+    /// - All other platforms: Currently behaves like [`PresentMode::Immediate`].
+    #[doc(alias = "Vsync")]
+    #[default]
+    Fifo,
+    /// Presentation is not synchronized with the display ("vsync off").
+    ///
+    /// [`Surface::next_buffer`] returns as fast as the backend safely allows. Frames may be
+    /// produced faster than the display consumes them; excess frames are dropped by the
+    /// compositor, wasting the work spent rendering them.
+    #[doc(alias = "NoVsync")]
+    Immediate,
+    // TODO: `Mailbox`? On macOS/iOS the `CALayer.contents` swap already behaves like a mailbox
+    // when rendering faster than the display, so `Immediate` mostly covers it.
 }
 
 /// Convenience helpers.

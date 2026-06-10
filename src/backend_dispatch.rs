@@ -1,6 +1,8 @@
 //! Implements `buffer_interface::*` traits for enums dispatching to backends
 
-use crate::{backend_interface::*, backends, AlphaMode, InitError, Pixel, Rect, SoftBufferError};
+use crate::{
+    backend_interface::*, backends, AlphaMode, InitError, Pixel, PresentMode, Rect, SoftBufferError,
+};
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::fmt;
@@ -123,6 +125,15 @@ macro_rules! make_dispatch {
                     $(
                         $(#[$attr])*
                         Self::$name(inner) => Ok(BufferDispatch::$name(inner.next_buffer(alpha_mode)?)),
+                    )*
+                }
+            }
+
+            fn set_present_mode(&mut self, present_mode: PresentMode) {
+                match self {
+                    $(
+                        $(#[$attr])*
+                        Self::$name(inner) => inner.set_present_mode(present_mode),
                     )*
                 }
             }

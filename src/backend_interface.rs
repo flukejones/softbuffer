@@ -1,6 +1,6 @@
 //! Interface implemented by backends
 
-use crate::{AlphaMode, InitError, Pixel, Rect, SoftBufferError};
+use crate::{AlphaMode, InitError, Pixel, PresentMode, Rect, SoftBufferError};
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::num::NonZeroU32;
@@ -38,6 +38,11 @@ pub(crate) trait SurfaceInterface<D: HasDisplayHandle + ?Sized, W: HasWindowHand
 
     /// Get the next buffer to render into.
     fn next_buffer(&mut self, alpha_mode: AlphaMode) -> Result<Self::Buffer<'_>, SoftBufferError>;
+
+    /// Set how presenting is synchronized with the display.
+    ///
+    /// Backends without vsync control ignore this (effectively always `Immediate`).
+    fn set_present_mode(&mut self, _present_mode: PresentMode) {}
 
     /// Fetch the buffer from the window.
     fn fetch(&mut self) -> Result<Vec<Pixel>, SoftBufferError> {
